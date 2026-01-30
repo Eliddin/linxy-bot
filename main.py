@@ -5,8 +5,6 @@ import asyncio
 import sqlite3
 import os
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request
-import uvicorn
 
 # === Настройки ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -450,15 +448,10 @@ async def cmd_clear_all_dialogs(message: types.Message):
     db.commit()
     await message.answer("✅ Вся история переписки очищена.")
 
-# === FastAPI endpoint для webhook ===
-app = FastAPI()
+# === Запуск бота ===
+if __name__ == '__main__':
+    import asyncio
+    async def main():
+        await dp.start_polling(bot)
 
-@app.post("/webhook")
-async def webhook_handler(request: Request):
-    update = await request.json()
-    await dp.feed_update(bot, update)
-    return {"status": "ok"}
-
-@app.get("/")
-def index():
-    return {"status": "alive"}
+    asyncio.run(main())
