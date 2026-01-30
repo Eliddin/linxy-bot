@@ -5,10 +5,18 @@ import asyncio
 import sqlite3
 import os
 from datetime import datetime, timedelta
+from fastapi import FastAPI, Request
+import uvicorn
 
 # === Настройки ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не установлен")
+
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+if not ADMIN_USER_ID:
+    raise ValueError("ADMIN_USER_ID не установлен")
+ADMIN_USER_ID = int(ADMIN_USER_ID)
 
 # === Хранилище для связи админ ↔ пользователь ===
 current_user = {}
@@ -442,24 +450,15 @@ async def cmd_clear_all_dialogs(message: types.Message):
     db.commit()
     await message.answer("✅ Вся история переписки очищена.")
 
-if __name__ == '__main__':
-    import uvicorn
-    from fastapi import FastAPI
-    app = FastAPI()
+# === FastAPI endpoint для webhook ===
+app = FastAPI()
 
-    @app.get("/")
-    def index():
-        return {"status": "alive"}
+@app.post("/webhook")
+async def webhook_handler(request: Request):
+    update = await request.json()
+    await dp.feed_update(bot, update)
+    return {"status": "ok"}
 
-    # Запуск бота в отдельном процессе
-    import threading
-    def run_bot():
-        import asyncio
-        async def start():
-            await dp.start_polling(bot)
-        asyncio.run(start())
-
-    thread = threading.Thread(target=run_bot, daemon=True)
-    thread.start()
-
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+@app.get("/")
+def index():
+    return {"status": "alive"}
