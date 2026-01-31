@@ -21,6 +21,8 @@ ADMIN_USER_ID = int(ADMIN_USER_ID)
 
 # === Хранилище для связи админ ↔ пользователь ===
 current_user = {}
+# === Список пользователей, которым разрешено писать ===
+allowed_users = set()
 
 # === База данных ===
 db_path = os.getenv("DATABASE_URL", "dialogs.db")
@@ -60,6 +62,7 @@ dp = Dispatcher()
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📝 Оставить заявку на работу")
+    builder.button(text="❓ Задать вопрос")
     builder.button(text="❌ Отмена")
     builder.adjust(1)
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
@@ -76,7 +79,6 @@ def get_vacancy_keyboard():
 # === Кнопки для администратора ===
 def get_admin_keyboard():
     builder = ReplyKeyboardBuilder()
-    builder.button(text="📝 Оставить заявку на работу")
     builder.button(text="👥 Пользователи")
     builder.button(text="🗂 История")
     builder.button(text="🧹 Очистить старые")
@@ -98,8 +100,17 @@ async def save_and_forward_content(message: types.Message, content_type: str, co
     ''', (user_id, 'user', content_type, content, first_name, username))
     db.commit()
 
-    await bot.forward_message(chat_id=ADMIN_USER_ID, from_chat_id=user_id, message_id=message.message_id)
-    await bot.send_message(chat_id=ADMIN_USER_ID, text=f"👤 От: {first_name} (@{username or 'no_username'})\nid: {user_id}")
+    # Если это вопрос (а не заявка), добавляем кнопку "Ответить"
+    if content_type == 'question':
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💬 Ответить", callback_data=f"reply_{user_id}")
+        keyboard = builder.as_markup()
+
+        await bot.forward_message(chat_id=ADMIN_USER_ID, from_chat_id=user_id, message_id=message.message_id)
+        await bot.send_message(chat_id=ADMIN_USER_ID, text=f"Вам задали вопрос\n👤 От: {first_name} (@{username or 'no_username'})\nid: {user_id}", reply_markup=keyboard)
+    else:
+        await bot.forward_message(chat_id=ADMIN_USER_ID, from_chat_id=user_id, message_id=message.message_id)
+        await bot.send_message(chat_id=ADMIN_USER_ID, text=f"👤 От: {first_name} (@{username or 'no_username'})\nid: {user_id}")
 
 # === Команда /start ===
 @dp.message(Command('start'))
@@ -235,14 +246,28 @@ async def handle_user_id_input(message: types.Message):
     await message.answer(f"✅ Диалог с пользователем ID: {target_user_id} начат.\nТеперь пишите сообщение — оно будет отправлено ему.")
 
 # === Обработка кнопок ===
-@dp.message(lambda msg: msg.text in ["📝 Оставить заявку на работу", "❌ Отмена"])
+@dp.message(lambda msg: msg.text in ["📝 Оставить заявку на работу", "❓ Задать вопрос", "❌ Отмена"])
 async def handle_user_buttons(message: types.Message):
     user_id = message.from_user.id
     if user_id == ADMIN_USER_ID:
         return
 
     if message.text == "📝 Оставить заявку на работу":
+        allowed_users.add(user_id)
         await message.answer("Выберите роль:", reply_markup=get_vacancy_keyboard())
+    elif message.text == "❓ Задать вопрос":
+        allowed_users.add(user_id)
+        await message.answer("Можете задавать вопрос администратору")
+
+        # Сохраняем в базу, что пользователь начал взаимодействие
+        first_name = message.from_user.first_name
+        username = message.from_user.username
+
+        cursor.execute('''
+            INSERT INTO messages (user_id, sender, content_type, content, first_name, username)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, 'user', 'question_initiated', 'Пользователь начал задавать вопрос', first_name, username))
+        db.commit()
     elif message.text == "❌ Отмена":
         await message.answer("❌ Действие отменено.", reply_markup=get_main_keyboard())
 
@@ -259,7 +284,10 @@ async def process_vacancy_selection(callback_query: types.CallbackQuery):
     selected_vacancy = vacancies.get(callback_query.data)
     if selected_vacancy:
         # Отправляем пользователю уведомление
-        await callback_query.message.answer("✅ Ваша заявка отправлена администратору, ожидайте.\n\nТеперь вы можете писать сообщения, и они будут пересланы администратору.")
+        await callback_query.message.answer(
+            "✅ Ваша заявка отправлена администратору, ожидайте.\n\n"
+            "Теперь вы можете писать сообщения, и они будут пересланы администратору."
+        )
 
         # Сохраняем в базу
         user_id = callback_query.from_user.id
@@ -281,6 +309,17 @@ async def process_vacancy_selection(callback_query: types.CallbackQuery):
             ADMIN_USER_ID,
             f"👥 Новый работник на вакансию: {selected_vacancy}\n👤 От: {first_name} (@{username or 'no_username'})",
             reply_markup=keyboard
+        )
+
+        # === Выводим анкету ===
+        await callback_query.message.answer(
+            "А теперь давайте заполним небольшую анкетку\n\n"
+            "1. Ссылка на ваш профиль на мангалиб\n"
+            "2. Возраст\n"
+            "3. Есть ли фотошоп\n"
+            "4. Ваш часовой пояс\n"
+            "5. Сколько времени можете уделять работе?\n"
+            "6. Жанры, с которыми хотите и не хотите работать"
         )
 
     await callback_query.answer()
@@ -320,16 +359,27 @@ async def handle_text(message: types.Message):
         else:
             await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
     else:
-        # Любой текст от пользователя — пересылаем админу
-        await save_and_forward_content(message, 'text', message.text)
+        # Проверяем, может ли пользователь отправлять сообщения
+        if user_id in allowed_users:
+            # Проверим, является ли это вопросом (после нажатия "Задать вопрос")
+            cursor.execute('SELECT 1 FROM messages WHERE user_id = ? AND content_type = ? LIMIT 1', (user_id, 'question_initiated'))
+            if cursor.fetchone():
+                await save_and_forward_content(message, 'question', message.text)
+            else:
+                await save_and_forward_content(message, 'text', message.text)
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
 
 # === Обработка фото ===
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        caption = message.caption or "Фото без описания"
-        await save_and_forward_content(message, 'photo', caption)
+        if user_id in allowed_users:
+            caption = message.caption or "Фото без описания"
+            await save_and_forward_content(message, 'photo', caption)
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять фото как ответ
         if user_id in current_user:
@@ -345,8 +395,11 @@ async def handle_photo(message: types.Message):
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        caption = message.caption or "Документ"
-        await save_and_forward_content(message, 'document', caption)
+        if user_id in allowed_users:
+            caption = message.caption or "Документ"
+            await save_and_forward_content(message, 'document', caption)
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять документ как ответ
         if user_id in current_user:
@@ -362,7 +415,10 @@ async def handle_document(message: types.Message):
 async def handle_voice(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await save_and_forward_content(message, 'voice', "Голосовое сообщение")
+        if user_id in allowed_users:
+            await save_and_forward_content(message, 'voice', "Голосовое сообщение")
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять голос как ответ
         if user_id in current_user:
@@ -378,8 +434,11 @@ async def handle_voice(message: types.Message):
 async def handle_video(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        caption = message.caption or "Видео"
-        await save_and_forward_content(message, 'video', caption)
+        if user_id in allowed_users:
+            caption = message.caption or "Видео"
+            await save_and_forward_content(message, 'video', caption)
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять видео как ответ
         if user_id in current_user:
@@ -395,8 +454,11 @@ async def handle_video(message: types.Message):
 async def handle_audio(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        caption = message.caption or "Аудио"
-        await save_and_forward_content(message, 'audio', caption)
+        if user_id in allowed_users:
+            caption = message.caption or "Аудио"
+            await save_and_forward_content(message, 'audio', caption)
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять аудио как ответ
         if user_id in current_user:
@@ -412,7 +474,10 @@ async def handle_audio(message: types.Message):
 async def handle_sticker(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await save_and_forward_content(message, 'sticker', "Стикер")
+        if user_id in allowed_users:
+            await save_and_forward_content(message, 'sticker', "Стикер")
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять стикер как ответ
         if user_id in current_user:
@@ -428,7 +493,10 @@ async def handle_sticker(message: types.Message):
 async def handle_video_note(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await save_and_forward_content(message, 'video_note', "Видеосообщение")
+        if user_id in allowed_users:
+            await save_and_forward_content(message, 'video_note', "Видеосообщение")
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять видеосообщение как ответ
         if user_id in current_user:
@@ -444,7 +512,10 @@ async def handle_video_note(message: types.Message):
 async def handle_contact(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await save_and_forward_content(message, 'contact', f"Контакт: {message.contact.first_name}")
+        if user_id in allowed_users:
+            await save_and_forward_content(message, 'contact', f"Контакт: {message.contact.first_name}")
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять контакт как ответ
         if user_id in current_user:
@@ -460,7 +531,10 @@ async def handle_contact(message: types.Message):
 async def handle_location(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await save_and_forward_content(message, 'location', f"Местоположение: {message.location.latitude}, {message.location.longitude}")
+        if user_id in allowed_users:
+            await save_and_forward_content(message, 'location', f"Местоположение: {message.location.latitude}, {message.location.longitude}")
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять местоположение как ответ
         if user_id in current_user:
@@ -476,7 +550,10 @@ async def handle_location(message: types.Message):
 async def handle_poll(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await save_and_forward_content(message, 'poll', f"Опрос: {message.poll.question}")
+        if user_id in allowed_users:
+            await save_and_forward_content(message, 'poll', f"Опрос: {message.poll.question}")
+        else:
+            await message.answer("Для начала взаимодействия с администратором выберите одну из кнопок: 'Оставить заявку' или 'Задать вопрос'")
     else:
         # Админ может отправлять опрос как ответ
         if user_id in current_user:
