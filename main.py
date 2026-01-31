@@ -121,6 +121,15 @@ async def cmd_start(message: types.Message):
             reply_markup=get_main_keyboard()
         )
 
+# === Команда /menu ===
+@dp.message(Command('menu', 'меню'))
+async def cmd_menu(message: types.Message):
+    user_id = message.from_user.id
+    if user_id == ADMIN_USER_ID:
+        await message.answer("Выберите действие:", reply_markup=get_admin_keyboard())
+    else:
+        await message.answer("Для подачи заявки используйте кнопки.", reply_markup=get_main_keyboard())
+
 # === Команда /users ===
 @dp.message(Command('users'))
 async def cmd_users(message: types.Message):
