@@ -6,6 +6,9 @@ import sqlite3
 import os
 from datetime import datetime, timedelta
 
+# === Добавим F ===
+from aiogram import F
+
 # === Настройки ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -202,7 +205,7 @@ async def handle_admin_buttons(message: types.Message):
             await message.answer("ℹ️ Диалог не был начат.")
 
 # === Обработка ввода ID пользователя ===
-@dp.message(F.text.regexp(r'^\d+$'))
+@dp.message(F.text.func(lambda text: text.isdigit()))
 async def handle_user_id_input(message: types.Message):
     user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
@@ -296,8 +299,6 @@ async def process_reply_request(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 # === Обработка текста ===
-from aiogram import F
-
 @dp.message(F.text & ~F.text.startswith('/'))
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
