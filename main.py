@@ -77,6 +77,7 @@ def get_admin_keyboard():
     builder.button(text="🗂 История", callback_data="history")
     builder.button(text="🧹 Очистить старые", callback_data="cleanup_now")
     builder.button(text="🗑 Очистить всё", callback_data="clear_all_dialogs")
+    builder.button(text="⏹ Завершить диалог", callback_data="end_dialog")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -123,6 +124,35 @@ async def cmd_menu(message: types.Message):
         await message.answer("Выберите действие:", reply_markup=get_admin_keyboard())
     else:
         await message.answer("Для подачи заявки используйте кнопки.", reply_markup=get_main_keyboard())
+
+# === Команда /users ===
+@dp.message(Command('users'))
+async def cmd_users(message: types.Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+
+    cursor.execute('''
+        SELECT DISTINCT user_id, first_name, username
+        FROM messages
+        WHERE first_name IS NOT NULL OR username IS NOT NULL
+        ORDER BY user_id
+    ''')
+    users = cursor.fetchall()
+
+    if not users:
+        await message.answer("❌ Нет пользователей с перепиской.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for user_id, first_name, username in users:
+        name = first_name or "Неизвестный"
+        uname = f" (@{username})" if username else ""
+        builder.button(
+            text=f"💬 {name}{uname} (ID: {user_id})",
+            callback_data=f"start_dialog_{user_id}"
+        )
+    builder.adjust(1)
+    await message.answer("👥 Выберите пользователя для диалога:", reply_markup=builder.as_markup())
 
 # === Обработка кнопок ===
 @dp.message(lambda msg: msg.text in ["📝 Оставить заявку на работу", "❌ Отмена"])
@@ -174,26 +204,39 @@ async def process_vacancy_selection(callback_query: types.CallbackQuery):
 
     await callback_query.answer()
 
-# === Обработка кнопки "Ответить" ===
-@dp.callback_query(lambda c: c.data.startswith('reply_'))
-async def process_reply_request(callback_query: types.CallbackQuery):
+# === Обработка кнопки "Начать диалог" ===
+@dp.callback_query(lambda c: c.data.startswith('start_dialog_'))
+async def start_dialog(callback_query: types.CallbackQuery):
     if callback_query.from_user.id != ADMIN_USER_ID:
         await callback_query.answer("❌ Доступ запрещён.")
         return
 
     try:
-        user_id = int(callback_query.data.split('_')[1])
+        user_id = int(callback_query.data.split('_')[2])
     except ValueError:
         await callback_query.answer("❌ Ошибка в ID.")
         return
 
-    # Сохраняем текущего пользователя для админа
     current_user[callback_query.from_user.id] = user_id
-
     await callback_query.message.answer(
-        f"📝 Готов к ответу пользователю ID: {user_id}\n\nНапишите сообщение — оно будет отправлено ему.",
+        f"✅ Диалог с пользователем ID: {user_id} начат.\n\nТеперь напишите сообщение — оно будет отправлено ему.",
         reply_markup=types.ReplyKeyboardRemove()
     )
+    await callback_query.answer()
+
+# === Обработка кнопки "Завершить диалог" ===
+@dp.callback_query(lambda c: c.data == 'end_dialog')
+async def end_dialog(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_USER_ID:
+        await callback_query.answer("❌ Доступ запрещён.")
+        return
+
+    admin_id = callback_query.from_user.id
+    if admin_id in current_user:
+        del current_user[admin_id]
+        await callback_query.message.answer("⏹ Диалог завершён.")
+    else:
+        await callback_query.message.answer("ℹ️ Диалог не был начат.")
     await callback_query.answer()
 
 # === Обработка текста ===
@@ -208,9 +251,8 @@ async def handle_text(message: types.Message):
             target_user_id = current_user[user_id]
             await bot.send_message(target_user_id, f"💬 Ответ администратора:\n{message.text}")
             await message.answer("✅ Ответ отправлен пользователю.")
-            del current_user[user_id]  # очищаем
         else:
-            await message.answer("❌ Ответьте на сообщение пользователя, чтобы ответить.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
     else:
         # Любой текст от пользователя — пересылаем админу
         await save_and_forward_content(message, 'text', message.text)
@@ -224,11 +266,13 @@ async def handle_photo(message: types.Message):
         await save_and_forward_content(message, 'photo', caption)
     else:
         # Админ может отправлять фото как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "🖼 Фото-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "🖼 Фото-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Фото отправлено пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка документов ===
 @dp.message(F.document)
@@ -239,11 +283,13 @@ async def handle_document(message: types.Message):
         await save_and_forward_content(message, 'document', caption)
     else:
         # Админ может отправлять документ как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "📁 Документ-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "📁 Документ-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Документ отправлен пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка голосовых ===
 @dp.message(F.voice)
@@ -253,11 +299,13 @@ async def handle_voice(message: types.Message):
         await save_and_forward_content(message, 'voice', "Голосовое сообщение")
     else:
         # Админ может отправлять голос как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "🎤 Голосовой-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "🎤 Голосовой-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Голос отправлен пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка видео ===
 @dp.message(F.video)
@@ -268,11 +316,13 @@ async def handle_video(message: types.Message):
         await save_and_forward_content(message, 'video', caption)
     else:
         # Админ может отправлять видео как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "📹 Видео-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "📹 Видео-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Видео отправлено пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка аудио ===
 @dp.message(F.audio)
@@ -283,11 +333,13 @@ async def handle_audio(message: types.Message):
         await save_and_forward_content(message, 'audio', caption)
     else:
         # Админ может отправлять аудио как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "🎵 Аудио-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "🎵 Аудио-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Аудио отправлено пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка стикеров ===
 @dp.message(F.sticker)
@@ -297,11 +349,13 @@ async def handle_sticker(message: types.Message):
         await save_and_forward_content(message, 'sticker', "Стикер")
     else:
         # Админ может отправлять стикер как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "😊 Стикер-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "😊 Стикер-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Стикер отправлен пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка видеосообщений ===
 @dp.message(F.video_note)
@@ -311,11 +365,13 @@ async def handle_video_note(message: types.Message):
         await save_and_forward_content(message, 'video_note', "Видеосообщение")
     else:
         # Админ может отправлять видеосообщение как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, "📹 Видеосообщение-ответ от администратора:")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, "📹 Видеосообщение-ответ от администратора:")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Видеосообщение отправлено пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка контактов ===
 @dp.message(F.contact)
@@ -325,11 +381,13 @@ async def handle_contact(message: types.Message):
         await save_and_forward_content(message, 'contact', f"Контакт: {message.contact.first_name}")
     else:
         # Админ может отправлять контакт как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, f"👤 Контакт-ответ от администратора: {message.contact.first_name}")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, f"👤 Контакт-ответ от администратора: {message.contact.first_name}")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Контакт отправлен пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка местоположения ===
 @dp.message(F.location)
@@ -339,11 +397,13 @@ async def handle_location(message: types.Message):
         await save_and_forward_content(message, 'location', f"Местоположение: {message.location.latitude}, {message.location.longitude}")
     else:
         # Админ может отправлять местоположение как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, f"📍 Местоположение-ответ от администратора: {message.location.latitude}, {message.location.longitude}")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, f"📍 Местоположение-ответ от администратора: {message.location.latitude}, {message.location.longitude}")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Местоположение отправлено пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка опросов ===
 @dp.message(F.poll)
@@ -353,11 +413,13 @@ async def handle_poll(message: types.Message):
         await save_and_forward_content(message, 'poll', f"Опрос: {message.poll.question}")
     else:
         # Админ может отправлять опрос как ответ
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            original_user_id = message.reply_to_message.forward_from.id
-            await bot.send_message(original_user_id, f"📊 Опрос-ответ от администратора: {message.poll.question}")
-            await bot.copy_message(original_user_id, message.chat.id, message.message_id)
+        if user_id in current_user:
+            target_user_id = current_user[user_id]
+            await bot.send_message(target_user_id, f"📊 Опрос-ответ от администратора: {message.poll.question}")
+            await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Опрос отправлен пользователю.")
+        else:
+            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
 
 # === Обработка кнопок админа ===
 @dp.callback_query(lambda c: c.data in ['users', 'history', 'cleanup_now', 'clear_all_dialogs'])
@@ -374,15 +436,20 @@ async def process_callback_admin(callback_query: types.CallbackQuery):
             ORDER BY user_id
         ''')
         users = cursor.fetchall()
+
         if not users:
             await callback_query.message.answer("❌ Нет пользователей с перепиской.")
         else:
-            text = "👥 Пользователи:\n"
+            builder = InlineKeyboardBuilder()
             for user_id, first_name, username in users:
                 name = first_name or "Неизвестный"
                 uname = f" (@{username})" if username else ""
-                text += f"🆔 {user_id}: {name}{uname}\n"
-            await callback_query.message.answer(text)
+                builder.button(
+                    text=f"💬 {name}{uname} (ID: {user_id})",
+                    callback_data=f"start_dialog_{user_id}"
+                )
+            builder.adjust(1)
+            await callback_query.message.answer("👥 Выберите пользователя для диалога:", reply_markup=builder.as_markup())
 
     elif callback_query.data == 'history':
         await callback_query.message.answer("Введите ID пользователя: /history <id>")
