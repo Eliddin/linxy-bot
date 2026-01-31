@@ -72,14 +72,16 @@ def get_vacancy_keyboard():
 
 # === Кнопки для администратора ===
 def get_admin_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="👥 Пользователи", callback_data="users")
-    builder.button(text="🗂 История", callback_data="history")
-    builder.button(text="🧹 Очистить старые", callback_data="cleanup_now")
-    builder.button(text="🗑 Очистить всё", callback_data="clear_all_dialogs")
-    builder.button(text="⏹ Завершить диалог", callback_data="end_dialog")
-    builder.adjust(1)
-    return builder.as_markup()
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="📝 Оставить заявку на работу")
+    builder.button(text="👥 Пользователи")
+    builder.button(text="🗂 История")
+    builder.button(text="🧹 Очистить старые")
+    builder.button(text="🗑 Очистить всё")
+    builder.button(text="⏹ Завершить диалог")
+    builder.button(text="❌ Отмена")
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 # === Сохранение и пересылка сообщения ===
 async def save_and_forward_content(message: types.Message, content_type: str, content: str):
@@ -116,15 +118,6 @@ async def cmd_start(message: types.Message):
             reply_markup=get_main_keyboard()
         )
 
-# === Команда /menu ===
-@dp.message(Command('menu', 'меню'))
-async def cmd_menu(message: types.Message):
-    user_id = message.from_user.id
-    if user_id == ADMIN_USER_ID:
-        await message.answer("Выберите действие:", reply_markup=get_admin_keyboard())
-    else:
-        await message.answer("Для подачи заявки используйте кнопки.", reply_markup=get_main_keyboard())
-
 # === Команда /users ===
 @dp.message(Command('users'))
 async def cmd_users(message: types.Message):
@@ -143,21 +136,97 @@ async def cmd_users(message: types.Message):
         await message.answer("❌ Нет пользователей с перепиской.")
         return
 
-    builder = InlineKeyboardBuilder()
+    text = "👥 Пользователи:\n"
     for user_id, first_name, username in users:
         name = first_name or "Неизвестный"
         uname = f" (@{username})" if username else ""
-        builder.button(
-            text=f"💬 {name}{uname} (ID: {user_id})",
-            callback_data=f"start_dialog_{user_id}"
-        )
-    builder.adjust(1)
-    await message.answer("👥 Выберите пользователя для диалога:", reply_markup=builder.as_markup())
+        text += f"🆔 {user_id}: {name}{uname}\n"
+    await message.answer(text + "\n\nНапишите ID пользователя, чтобы начать диалог:")
+
+# === Обработка кнопок админа ===
+@dp.message(lambda msg: msg.text in [
+    "👥 Пользователи",
+    "🗂 История",
+    "🧹 Очистить старые",
+    "🗑 Очистить всё",
+    "⏹ Завершить диалог"
+])
+async def handle_admin_buttons(message: types.Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+
+    if message.text == "👥 Пользователи":
+        cursor.execute('''
+            SELECT DISTINCT user_id, first_name, username
+            FROM messages
+            WHERE first_name IS NOT NULL OR username IS NOT NULL
+            ORDER BY user_id
+        ''')
+        users = cursor.fetchall()
+        if not users:
+            await message.answer("❌ Нет пользователей с перепиской.")
+        else:
+            text = "👥 Пользователи:\n"
+            for user_id, first_name, username in users:
+                name = first_name or "Неизвестный"
+                uname = f" (@{username})" if username else ""
+                text += f"🆔 {user_id}: {name}{uname}\n"
+            await message.answer(text + "\n\nНапишите ID пользователя, чтобы начать диалог:")
+
+    elif message.text == "🗂 История":
+        await message.answer("Введите ID пользователя: /history <id>")
+
+    elif message.text == "🧹 Очистить старые":
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        cursor.execute('''
+            DELETE FROM messages WHERE user_id IN (
+                SELECT DISTINCT user_id FROM messages 
+                WHERE timestamp < ?
+                GROUP BY user_id
+            )
+        ''', (seven_days_ago.strftime('%Y-%m-%d %H:%M:%S'),))
+        db.commit()
+        await message.answer("✅ Старые диалоги очищены.")
+
+    elif message.text == "🗑 Очистить всё":
+        cursor.execute('DELETE FROM messages')
+        db.commit()
+        await message.answer("✅ Вся история переписки очищена.")
+
+    elif message.text == "⏹ Завершить диалог":
+        admin_id = message.from_user.id
+        if admin_id in current_user:
+            del current_user[admin_id]
+            await message.answer("⏹ Диалог завершён.")
+        else:
+            await message.answer("ℹ️ Диалог не был начат.")
+
+# === Обработка ввода ID пользователя ===
+@dp.message(F.text.regexp(r'^\d+$'))
+async def handle_user_id_input(message: types.Message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+
+    try:
+        target_user_id = int(message.text)
+    except ValueError:
+        return
+
+    # Проверим, есть ли такой пользователь в базе
+    cursor.execute('SELECT 1 FROM messages WHERE user_id = ? LIMIT 1', (target_user_id,))
+    if not cursor.fetchone():
+        await message.answer("❌ Пользователь с таким ID не найден.")
+        return
+
+    current_user[user_id] = target_user_id
+    await message.answer(f"✅ Диалог с пользователем ID: {target_user_id} начат.\nТеперь пишите сообщение — оно будет отправлено ему.")
 
 # === Обработка кнопок ===
 @dp.message(lambda msg: msg.text in ["📝 Оставить заявку на работу", "❌ Отмена"])
 async def handle_user_buttons(message: types.Message):
-    if message.from_user.id == ADMIN_USER_ID:
+    user_id = message.from_user.id
+    if user_id == ADMIN_USER_ID:
         return
 
     if message.text == "📝 Оставить заявку на работу":
@@ -204,39 +273,26 @@ async def process_vacancy_selection(callback_query: types.CallbackQuery):
 
     await callback_query.answer()
 
-# === Обработка кнопки "Начать диалог" ===
-@dp.callback_query(lambda c: c.data.startswith('start_dialog_'))
-async def start_dialog(callback_query: types.CallbackQuery):
+# === Обработка кнопки "Ответить" при новой заявке ===
+@dp.callback_query(lambda c: c.data.startswith('reply_'))
+async def process_reply_request(callback_query: types.CallbackQuery):
     if callback_query.from_user.id != ADMIN_USER_ID:
         await callback_query.answer("❌ Доступ запрещён.")
         return
 
     try:
-        user_id = int(callback_query.data.split('_')[2])
+        user_id = int(callback_query.data.split('_')[1])
     except ValueError:
         await callback_query.answer("❌ Ошибка в ID.")
         return
 
+    # Сохраняем текущего пользователя для админа
     current_user[callback_query.from_user.id] = user_id
+
     await callback_query.message.answer(
-        f"✅ Диалог с пользователем ID: {user_id} начат.\n\nТеперь напишите сообщение — оно будет отправлено ему.",
+        f"📝 Готов к ответу пользователю ID: {user_id}\n\nНапишите сообщение — оно будет отправлено ему.",
         reply_markup=types.ReplyKeyboardRemove()
     )
-    await callback_query.answer()
-
-# === Обработка кнопки "Завершить диалог" ===
-@dp.callback_query(lambda c: c.data == 'end_dialog')
-async def end_dialog(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_USER_ID:
-        await callback_query.answer("❌ Доступ запрещён.")
-        return
-
-    admin_id = callback_query.from_user.id
-    if admin_id in current_user:
-        del current_user[admin_id]
-        await callback_query.message.answer("⏹ Диалог завершён.")
-    else:
-        await callback_query.message.answer("ℹ️ Диалог не был начат.")
     await callback_query.answer()
 
 # === Обработка текста ===
@@ -252,7 +308,7 @@ async def handle_text(message: types.Message):
             await bot.send_message(target_user_id, f"💬 Ответ администратора:\n{message.text}")
             await message.answer("✅ Ответ отправлен пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
     else:
         # Любой текст от пользователя — пересылаем админу
         await save_and_forward_content(message, 'text', message.text)
@@ -272,7 +328,7 @@ async def handle_photo(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Фото отправлено пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка документов ===
 @dp.message(F.document)
@@ -289,7 +345,7 @@ async def handle_document(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Документ отправлен пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка голосовых ===
 @dp.message(F.voice)
@@ -305,7 +361,7 @@ async def handle_voice(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Голос отправлен пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка видео ===
 @dp.message(F.video)
@@ -322,7 +378,7 @@ async def handle_video(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Видео отправлено пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка аудио ===
 @dp.message(F.audio)
@@ -339,7 +395,7 @@ async def handle_audio(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Аудио отправлено пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка стикеров ===
 @dp.message(F.sticker)
@@ -355,7 +411,7 @@ async def handle_sticker(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Стикер отправлен пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка видеосообщений ===
 @dp.message(F.video_note)
@@ -371,7 +427,7 @@ async def handle_video_note(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Видеосообщение отправлено пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка контактов ===
 @dp.message(F.contact)
@@ -387,7 +443,7 @@ async def handle_contact(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Контакт отправлен пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка местоположения ===
 @dp.message(F.location)
@@ -403,7 +459,7 @@ async def handle_location(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Местоположение отправлено пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Обработка опросов ===
 @dp.message(F.poll)
@@ -419,59 +475,7 @@ async def handle_poll(message: types.Message):
             await bot.copy_message(target_user_id, message.chat.id, message.message_id)
             await message.answer("✅ Опрос отправлен пользователю.")
         else:
-            await message.answer("❌ Выберите пользователя для диалога через /users или кнопку Пользователи.")
-
-# === Обработка кнопок админа ===
-@dp.callback_query(lambda c: c.data in ['users', 'history', 'cleanup_now', 'clear_all_dialogs'])
-async def process_callback_admin(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_USER_ID:
-        await callback_query.answer("❌ Доступ запрещён.")
-        return
-
-    if callback_query.data == 'users':
-        cursor.execute('''
-            SELECT DISTINCT user_id, first_name, username
-            FROM messages
-            WHERE first_name IS NOT NULL OR username IS NOT NULL
-            ORDER BY user_id
-        ''')
-        users = cursor.fetchall()
-
-        if not users:
-            await callback_query.message.answer("❌ Нет пользователей с перепиской.")
-        else:
-            builder = InlineKeyboardBuilder()
-            for user_id, first_name, username in users:
-                name = first_name or "Неизвестный"
-                uname = f" (@{username})" if username else ""
-                builder.button(
-                    text=f"💬 {name}{uname} (ID: {user_id})",
-                    callback_data=f"start_dialog_{user_id}"
-                )
-            builder.adjust(1)
-            await callback_query.message.answer("👥 Выберите пользователя для диалога:", reply_markup=builder.as_markup())
-
-    elif callback_query.data == 'history':
-        await callback_query.message.answer("Введите ID пользователя: /history <id>")
-
-    elif callback_query.data == 'cleanup_now':
-        seven_days_ago = datetime.now() - timedelta(days=7)
-        cursor.execute('''
-            DELETE FROM messages WHERE user_id IN (
-                SELECT DISTINCT user_id FROM messages 
-                WHERE timestamp < ?
-                GROUP BY user_id
-            )
-        ''', (seven_days_ago.strftime('%Y-%m-%d %H:%M:%S'),))
-        db.commit()
-        await callback_query.message.answer("✅ Старые диалоги очищены.")
-
-    elif callback_query.data == 'clear_all_dialogs':
-        cursor.execute('DELETE FROM messages')
-        db.commit()
-        await callback_query.message.answer("✅ Вся история переписки очищена.")
-
-    await callback_query.answer()
+            await message.answer("❌ Выберите пользователя для диалога через /users или введите ID.")
 
 # === Команда /history ===
 @dp.message(Command('history'))
